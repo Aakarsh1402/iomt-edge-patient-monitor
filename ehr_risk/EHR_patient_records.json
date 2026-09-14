@@ -1,0 +1,80 @@
+{
+  "101": {
+    "name": "John Doe",
+    "age": 78,
+    "gender": "M",
+    "history": [
+      "Epilepsy",
+      "History of Stroke",
+      "Hypertension",
+      "Heart Failure",
+      "COPD",
+      "Type 2 Diabetes",
+      "Coronary Artery Disease (CAD)",
+      "Chronic Kidney Disease (CKD)"
+    ],
+    "medication": [
+      "Warfarin (Blood Thinner)",
+      "Phenytoin (Anticonvulsant)",
+      "Lisinopril (ACE Inhibitor)",
+      "Metoprolol (Beta Blocker)",
+      "Furosemide (Diuretic)",
+      "Insulin Glargine"
+    ],
+    "fall_risk": "High",
+    "vitals": {
+      "sbp": 155,
+      "dbp": 95,
+      "heart_rate": 92,
+      "respiratory_rate": 24,
+      "temperature": 37.2,
+      "spo2": 93,
+      "height_m": 1.75,
+      "weight_kg": 92,
+      "pain_score": 4
+    },
+    "labs": {
+      "glucose": 210,
+      "cholesterol_total": 245,
+      "creatinine": 1.8,
+      "bun": 28,
+      "hemoglobin": 11.5,
+      "wbc_count": 12.5,
+      "sodium": 134,
+      "potassium": 4.8,
+      "inr": 2.5,
+      "d_dimer": 450
+    }
+  },
+  "102": {
+    "name": "Alice Smith",
+    "age": 32,
+    "gender": "F",
+    "history": ["None"],
+    "medication": ["None"],
+    "fall_risk": "Low",
+    "vitals": {
+      "sbp": 115,
+      "dbp": 75,
+      "heart_rate": 68,
+      "respiratory_rate": 16,
+      "temperature": 36.7,
+      "spo2": 99,
+      "height_m": 1.65,
+      "weight_kg": 60,
+      "pain_score": 1
+    },
+    "labs": {
+      "glucose": 85,
+      "cholesterol_total": 160,
+      "creatinine": 0.7,
+      "bun": 12,
+      "hemoglobin": 13.8,
+      "wbc_count": 6.2,
+      "sodium": 140,
+      "potassium": 4.1,
+      "inr": 1.0,
+      "d_dimer": 200
+    }
+  }
+}

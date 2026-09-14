@@ -1,0 +1,17 @@
+{
+  "record": "102",
+  "database": "mitdb",
+  "sampling_rate": 360,
+  "length_seconds": 1805.5555555555557,
+  "samples": 650000,
+  "has_annotations": true,
+  "beat_counts": {
+    "+": 5,
+    "/": 2028,
+    "f": 56,
+    "N": 99,
+    "V": 4
+  },
+  "arrhythmia_beats": 2088,
+  "normal_beats": 99
+}

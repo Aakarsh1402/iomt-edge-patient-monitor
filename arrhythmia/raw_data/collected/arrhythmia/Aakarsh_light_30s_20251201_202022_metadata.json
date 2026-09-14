@@ -1,0 +1,11 @@
+{
+  "timestamp": "20251201_202022",
+  "subject_id": "Aakarsh",
+  "exercise_type": "light_30s",
+  "sample_duration": 10,
+  "samples_per_second": 360,
+  "total_samples": 3600,
+  "heart_rate_bpm": 138.0,
+  "peaks_detected": 23,
+  "notes": ""
+}

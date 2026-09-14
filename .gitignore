@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*:Zone.Identifier
+
+# Large intermediate data (regenerable)
+ehr_risk/fhir.zip
+ehr_risk/fhir_raw/
+ehr_risk/temp_parquet/
+ehr_risk/final_parquet_chunks/
+gesture_recognition/SisFall_dataset/
+gesture_recognition/ward_data_train.npz
+vision/Ward_Vision_Data/
+
+# Arduino build output
+firmware/**/build/
