@@ -7,6 +7,8 @@ from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
 import os
 
+from ward_model import WardGuardianCNN
+
 # --- CONFIGURATION ---
 BATCH_SIZE = 64
 EPOCHS = 20
@@ -16,20 +18,6 @@ DATA_TRAIN = "ward_data_train.npz"
 DATA_TEST = "ward_data_test.npz"
 
 device = torch.device("cpu")
-
-# --- MODEL ---
-class WardGuardianCNN(nn.Module):
-    def __init__(self):
-        super(WardGuardianCNN, self).__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv1d(3, 32, 5, padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(32, 64, 3, padding=1), nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(64, 128, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool1d(1)
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(), nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.4), nn.Linear(64, 12)
-        )
-    def forward(self, x): return self.classifier(self.cnn(x))
 
 # --- LOAD DATA ---
 print("Loading Data...")
@@ -106,7 +94,7 @@ for epoch in range(EPOCHS):
     try:
         # We must handle cases where a batch might miss a class, though rare with big datasets
         auc = roc_auc_score(all_labels, all_probs, multi_class='ovr', average='macro')
-    except:
+    except ValueError:
         auc = 0.5 # Fallback if calculation fails (e.g. only 1 class in batch)
         
     history['val_auc'].append(auc)

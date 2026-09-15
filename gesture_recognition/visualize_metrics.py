@@ -1,44 +1,29 @@
-import torch
-import torch.nn as nn
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.metrics import confusion_matrix
-import pandas as pd
 import os
 
+import matplotlib
+matplotlib.use("Agg")  # headless-safe: we only write PNGs
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.metrics import confusion_matrix
+from torch.utils.data import DataLoader, TensorDataset
+
+from ward_model import CLASSES as CLASS_LABELS, DEFAULT_MODEL_FILE, load_model
+
 # --- CONFIGURATION ---
-MODEL_FILE = "ward_model_strict.pth"
-DATA_FILE = "ward_data_test.npz" # We evaluate ONLY on the unseen test subjects
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODEL_FILE = DEFAULT_MODEL_FILE
+DATA_FILE = os.path.join(HERE, "ward_data_test.npz")  # We evaluate ONLY on the unseen test subjects
 BATCH_SIZE = 64
 device = torch.device("cpu")
 
-CLASSES = [
-    "0: Lying", "1: Sitting", "2: Walking", 
-    "3: FALL", "4: SEIZURE", "5: Slump", 
-    "6: Agitation", "7: Choking", "8: Vomit", 
-    "9: CPR", "10: Resp.Distress", "11: Transport"
-]
-
-# --- MODEL DEFINITION (Must match Strict Training Script) ---
-class WardGuardianCNN(nn.Module):
-    def __init__(self):
-        super(WardGuardianCNN, self).__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv1d(3, 32, 5, padding=2), nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(32, 64, 3, padding=1), nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(64, 128, 3, padding=1), nn.ReLU(), nn.AdaptiveAvgPool1d(1)
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(), nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.4), nn.Linear(64, 12)
-        )
-    def forward(self, x): return self.classifier(self.cnn(x))
+CLASSES = [f"{i}: {name}" for i, name in enumerate(CLASS_LABELS)]
 
 # --- LOAD DATA ---
 print(f"Loading Test Data from {DATA_FILE}...")
 if not os.path.exists(DATA_FILE):
-    print(f"Error: {DATA_FILE} not found. Did you run 'process_ward_data_strict.py'?")
+    print(f"Error: {DATA_FILE} not found. Did you run 'process_ward_data.py'?")
     exit()
 
 data = np.load(DATA_FILE)
@@ -51,14 +36,8 @@ print(f"Evaluating on {len(X)} samples from UNSEEN subjects.")
 test_loader = DataLoader(TensorDataset(X, y), batch_size=BATCH_SIZE, shuffle=False)
 
 # --- LOAD MODEL ---
-model = WardGuardianCNN().to(device)
-try:
-    model.load_state_dict(torch.load(MODEL_FILE, map_location=device))
-    model.eval()
-    print("Model Loaded.")
-except:
-    print(f"Error: Could not find '{MODEL_FILE}'")
-    exit()
+model = load_model(MODEL_FILE, device)
+print("Model Loaded.")
 
 # --- RUN INFERENCE ---
 all_preds = []
@@ -77,12 +56,19 @@ with torch.no_grad():
 print("Generating Confusion Matrix...")
 cm = confusion_matrix(all_labels, all_preds)
 plt.figure(figsize=(12, 10))
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=CLASSES, yticklabels=CLASSES)
+plt.imshow(cm, cmap='Blues')
+plt.colorbar()
+plt.xticks(range(len(CLASSES)), CLASSES, rotation=45, ha='right')
+plt.yticks(range(len(CLASSES)), CLASSES)
+for i in range(cm.shape[0]):
+    for j in range(cm.shape[1]):
+        plt.text(j, i, cm[i, j], ha='center', va='center',
+                 color='white' if cm[i, j] > cm.max() / 2 else 'black')
 plt.xlabel('Predicted By AI')
 plt.ylabel('Actual Reality (Test Subjects)')
 plt.title('Strict Evaluation: Unseen Patients')
 plt.tight_layout()
-plt.savefig('viz_confusion_matrix_strict.png')
+plt.savefig(os.path.join(HERE, 'viz_confusion_matrix_strict.png'))
 print("Saved 'viz_confusion_matrix_strict.png'")
 
 # --- VISUALIZATION 2: PER-CLASS ACCURACY ---
@@ -106,7 +92,7 @@ plt.ylabel('Accuracy (%)')
 plt.title('Reliability on New Patients')
 plt.xticks(rotation=45, ha='right')
 plt.tight_layout()
-plt.savefig('viz_accuracy_chart_strict.png')
+plt.savefig(os.path.join(HERE, 'viz_accuracy_chart_strict.png'))
 print("Saved 'viz_accuracy_chart_strict.png'")
 
 print("\nDONE. Check the PNG files.")
