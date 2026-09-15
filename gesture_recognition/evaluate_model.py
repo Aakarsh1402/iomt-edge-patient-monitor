@@ -1,131 +1,86 @@
-import torch
-import torch.nn as nn
+"""Evaluate the IMU motion classifier on the held-out (unseen-subject) test set.
+
+Usage:
+    python evaluate_model.py                       # ward_model_strict.pth on ward_data_test.npz
+    python evaluate_model.py --model ward_model.pth
+"""
+import argparse
+import os
+
 import numpy as np
-from torch.utils.data import TensorDataset, DataLoader
-from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
 import pandas as pd
+import torch
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score
+from torch.utils.data import DataLoader, TensorDataset
 
-# --- CONFIGURATION ---
+from ward_model import CLASSES, DEFAULT_MODEL_FILE, load_model
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_DATA_FILE = os.path.join(HERE, "ward_data_test.npz")
 BATCH_SIZE = 64
-MODEL_FILE = "ward_model.pth"
-DATA_FILE = "ward_data.npz"
-device = torch.device("cpu")
 
-# Class Names for readable reports
-CLASS_NAMES = [
-    "0: Lying Down",
-    "1: Sitting Up",
-    "2: Walking",
-    "3: FALL / IMPACT",
-    "4: SEIZURE",
-    "5: Slump/Pain",
-    "6: Agitation",
-    "7: CHOKING",
-    "8: VOMITING",
-    "9: CPR IN PROGRESS",
-    "10: RESP. DISTRESS",
-    "11: Transport"
-]
+CLASS_NAMES = [f"{i}: {name}" for i, name in enumerate(CLASSES)]
 
-# --- 1. DEFINE THE MODEL ARCHITECTURE (Must Match Training Exactly) ---
-class WardGuardianCNN(nn.Module):
-    def __init__(self):
-        super(WardGuardianCNN, self).__init__()
-        self.cnn = nn.Sequential(
-            nn.Conv1d(3, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(2),
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(), nn.AdaptiveAvgPool1d(1)
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(128, 64), nn.ReLU(), nn.Dropout(0.3),
-            nn.Linear(64, 12)
-        )
 
-    def forward(self, x):
-        return self.classifier(self.cnn(x))
+def evaluate(model_file, data_file, device="cpu"):
+    if not os.path.exists(data_file):
+        raise FileNotFoundError(f"{data_file} not found. Run process_ward_data.py first.")
 
-# --- 2. LOAD DATA & MODEL ---
-print("Loading Data & Model...")
-data = np.load(DATA_FILE)
-X = torch.FloatTensor(data['X'])
-y = torch.LongTensor(data['Y'])
+    data = np.load(data_file)
+    X = torch.FloatTensor(data["X"])
+    y = torch.LongTensor(data["Y"])
+    print(f"Evaluating on {len(X)} windows from unseen subjects ({os.path.basename(data_file)})")
 
-# Re-create the same split used in training to ensure we test on UNSEEN data
-dataset = TensorDataset(X, y)
-train_size = int(0.8 * len(dataset))
-test_size = len(dataset) - train_size
-# We use a fixed seed here to try and get the same split logic if possible, 
-# but for a quick test, using the random_split again gives a statistically valid evaluation.
-# ideally we would have saved the test indices, but this works for validation.
-_, test_dataset = torch.utils.data.random_split(dataset, [train_size, test_size], generator=torch.Generator().manual_seed(42))
+    model = load_model(model_file, device)
+    print(f"Model loaded: {os.path.basename(model_file)}")
 
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    loader = DataLoader(TensorDataset(X, y), batch_size=BATCH_SIZE, shuffle=False)
+    all_preds, all_labels, all_probs = [], [], []
+    with torch.no_grad():
+        for inputs, labels in loader:
+            outputs = model(inputs.to(device))
+            all_probs.extend(torch.softmax(outputs, dim=1).cpu().numpy())
+            all_preds.extend(outputs.argmax(1).cpu().numpy())
+            all_labels.extend(labels.numpy())
+    return np.array(all_labels), np.array(all_preds), np.array(all_probs)
 
-model = WardGuardianCNN().to(device)
-try:
-    model.load_state_dict(torch.load(MODEL_FILE, map_location=device))
-    model.eval()
-    print("Model loaded successfully.")
-except Exception as e:
-    print(f"Error loading model: {e}")
-    exit()
 
-# --- 3. RUN INFERENCE ---
-print(f"Evaluating on {len(test_dataset)} test samples...")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", default=DEFAULT_MODEL_FILE, help="checkpoint to evaluate")
+    parser.add_argument("--data", default=DEFAULT_DATA_FILE, help="test-set .npz (X, Y)")
+    args = parser.parse_args()
 
-all_preds = []
-all_labels = []
-all_probs = [] # For AUC
+    labels, preds, probs = evaluate(args.model, args.data)
 
-with torch.no_grad():
-    for inputs, labels in test_loader:
-        inputs = inputs.to(device)
-        outputs = model(inputs)
-        
-        # Get Probabilities (Softmax) for AUC
-        probs = torch.nn.functional.softmax(outputs, dim=1)
-        
-        # Get Predictions (Hard Class)
-        _, preds = torch.max(outputs, 1)
-        
-        all_preds.extend(preds.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        all_probs.extend(probs.cpu().numpy())
+    print("\n" + "=" * 60)
+    print("FINAL EVALUATION REPORT")
+    print("=" * 60)
+    present = sorted(set(labels) | set(preds))
+    print(classification_report(labels, preds, labels=present,
+                                target_names=[CLASS_NAMES[i] for i in present], digits=4))
 
-# --- 4. CALCULATE METRICS ---
-print("\n" + "="*60)
-print("FINAL EVALUATION REPORT")
-print("="*60)
+    print("-" * 60)
+    print("AUC SCORES (one-vs-rest):")
+    try:
+        auc_scores = roc_auc_score(labels, probs, multi_class="ovr", average=None)
+        for i, score in enumerate(auc_scores):
+            print(f"  {CLASS_NAMES[i]:<20} : {score:.4f}")
+    except ValueError as e:
+        print(f"  Could not compute AUC: {e}")
 
-# A. Classification Report (Precision, Recall, F1)
-report = classification_report(all_labels, all_preds, target_names=CLASS_NAMES, digits=4)
-print(report)
+    print("-" * 60)
+    print("CONFUSION MATRIX (row = true, col = predicted):")
+    cm = confusion_matrix(labels, preds, labels=range(len(CLASSES)))
+    print(pd.DataFrame(cm, index=range(len(CLASSES)), columns=range(len(CLASSES))))
 
-# B. AUC Scores (One-vs-Rest)
-print("-" * 60)
-print("AUC SCORES (Ability to distinguish this class from others):")
-try:
-    auc_scores = roc_auc_score(all_labels, all_probs, multi_class='ovr', average=None)
-    for i, score in enumerate(auc_scores):
-        print(f"  {CLASS_NAMES[i]:<20} : {score:.4f}")
-except ValueError:
-    print("Error calculating AUC. (Might require more samples per class in test set)")
+    print("=" * 60)
+    print(f"Overall accuracy: {100 * (labels == preds).mean():.2f}%")
+    print(" - Precision: when the model predicts 'FALL', how often is it right?")
+    print(" - Recall:    when a fall actually happens, how often is it caught?")
+    print(" - AUC:       1.0 is perfect, 0.5 is random guessing.")
+    print("=" * 60)
 
-# C. Confusion Matrix
-print("-" * 60)
-print("CONFUSION MATRIX (Row = True, Col = Predicted):")
-cm = confusion_matrix(all_labels, all_preds)
-# Print using Pandas for better readability
-df_cm = pd.DataFrame(cm, index=[i for i in range(12)], columns=[i for i in range(12)])
-print(df_cm)
 
-print("="*60)
-print("INTERPRETATION GUIDE:")
-print(" - Precision: When model predicts 'Fall', how often is it right?")
-print(" - Recall:    When a 'Fall' actually happens, how often does model catch it?")
-print(" - AUC:       1.0 is perfect, 0.5 is random guessing.")
-print("="*60)
+if __name__ == "__main__":
+    main()
