@@ -120,7 +120,9 @@ def main():
     parser.add_argument("--topic", default="test/imu_raw")
     parser.add_argument("--delay", type=float, default=1.0, help="seconds between scenario steps")
     parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--seed", type=int, default=0, help="RNG seed for the simulated IMU stream")
     args = parser.parse_args()
+    np.random.seed(args.seed)
 
     from ward_model import DEFAULT_MODEL_FILE, load_model, predict_window
 

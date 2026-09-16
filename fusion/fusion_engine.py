@@ -46,8 +46,11 @@ MOTION_SEVERITY = {
     "Agitation": 0.35,
 }
 
-# Events severe enough to page on their own, without corroboration.
+# Events severe enough to page on their own, without corroboration...
 CRITICAL_MOTION = {"FALL", "SEIZURE", "Choking", "CPR"}
+# ...but only when the classifier is sure. A 55 % "FALL" on a patient rolling
+# over is exactly the false alarm this system exists to suppress.
+CRITICAL_ALONE_MIN_CONFIDENCE = 0.75
 
 VISION_SEVERITY = {"Normal": 0.0, "Distress": 0.5, "Danger": 1.0}
 
@@ -75,6 +78,8 @@ UNCORROBORATED_CAP = 0.55
 ARRHYTHMIA_THRESHOLD = 0.7
 # Confidence below which a classifier output is treated as "no opinion".
 MIN_CONFIDENCE = 0.5
+# Clinical risks below this are not worth mentioning as amplifiers.
+MIN_CLINICAL_RISK = 0.05
 
 
 class AlertLevel(IntEnum):
@@ -149,7 +154,7 @@ def fuse(obs, thresholds=LEVEL_THRESHOLDS):
             # A matching known clinical risk amplifies the physical evidence.
             risk_key = MOTION_TO_CLINICAL_RISK.get(obs.motion_class)
             clinical = obs.clinical_risks.get(risk_key, 0.0) if risk_key else 0.0
-            if clinical > 0:
+            if clinical >= MIN_CLINICAL_RISK:
                 contribution *= 1.0 + CLINICAL_GAIN * clinical
                 reasons.append(
                     f"known {risk_key.replace('risk_', '').replace('_24h', '')} "
@@ -160,7 +165,8 @@ def fuse(obs, thresholds=LEVEL_THRESHOLDS):
             score += contribution
             reasons.insert(0, f"motion '{obs.motion_class}' at {obs.motion_confidence * 100:.0f}% confidence")
             modalities.insert(0, "physical")
-            critical_alone = obs.motion_class in CRITICAL_MOTION
+            critical_alone = (obs.motion_class in CRITICAL_MOTION
+                              and obs.motion_confidence >= CRITICAL_ALONE_MIN_CONFIDENCE)
 
     # --- visual (camera) ---
     if obs.vision_class and _confident(obs.vision_confidence):

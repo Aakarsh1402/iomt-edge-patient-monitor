@@ -61,6 +61,21 @@ def test_confirmed_fall_pages_without_corroboration():
     assert not result.suppressed
 
 
+def test_low_confidence_fall_alone_does_not_page():
+    """A 56% 'FALL' on a resting patient is a classifier wobble, not an event."""
+    result = fuse(Observation(motion_class="FALL", motion_confidence=0.56,
+                              clinical_risks={"risk_fall_risk_24h": 0.93}))
+    assert result.suppressed
+    assert not result.should_page
+
+
+def test_low_confidence_fall_with_camera_still_pages():
+    """...unless a second sensor backs it up."""
+    result = fuse(Observation(motion_class="FALL", motion_confidence=0.56,
+                              vision_class="Danger", vision_confidence=0.9))
+    assert result.should_page
+
+
 def test_fall_with_visual_confirmation_is_critical():
     result = fuse(Observation(motion_class="FALL", motion_confidence=0.98,
                               vision_class="Danger", vision_confidence=0.9,
@@ -78,6 +93,12 @@ def test_clinical_risk_amplifies_matching_event():
                             clinical_risks={"risk_fall_risk_24h": 0.95}))
     assert high.score > low.score
     assert "clinical" not in high.corroborating_modalities  # history is not a sensor
+
+
+def test_negligible_clinical_risk_is_not_cited():
+    result = fuse(Observation(motion_class="Slump", motion_confidence=0.9,
+                              clinical_risks={"risk_fall_risk_24h": 0.004}))
+    assert not any("amplifies" in r for r in result.reasons)
 
 
 def test_clinical_risk_alone_never_pages():
