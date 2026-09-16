@@ -84,6 +84,15 @@ class EHRRiskEngine:
         self.unsupported = [f for f, v in zip(self.features, self.scaler.var_) if v == 0]
         self._unsupported_idx = [self.features.index(f) for f in self.unsupported]
 
+        # Heads whose label never fired in training output a constant 0 for any
+        # input. ehr_tflite_map.py detects them while recovering the TFLite
+        # output order; surface them so a "0.0%" is not mistaken for a verdict.
+        self.untrained_heads = set()
+        map_file = os.path.join(model_dir, "ehr_tflite_outputs.json")
+        if os.path.exists(map_file):
+            with open(map_file) as f:
+                self.untrained_heads = set(json.load(f).get("constant_heads", []))
+
         # One warm-up call so the first real prediction is not dominated by graph tracing.
         self._predict(np.zeros((1, len(self.features)), dtype=np.float32))
 

@@ -1,117 +1,103 @@
-import time
+"""Benchmark the TFLite export of the EHR risk model and check it agrees with Keras.
+
+    python test_ehr_performance.py                 # latency + top risks for patient 101
+    python test_ehr_performance.py --patient 102 --runs 500 --no-compare
+
+Requires ehr_tflite_outputs.json (run ehr_tflite_map.py once after training):
+TFLite does not preserve the order of the 51 output heads, so reading them by
+index - as this script used to - labels every probability with the wrong risk.
+"""
+import argparse
 import json
-import joblib
+import os
+import sys
+import time
+
 import numpy as np
-import pandas as pd
-import tensorflow as tf
 
-# --- FILES TO LOAD ---
-MODEL_PATH = 'ehr_model.tflite'
-SCALER_PATH = 'ehr_scaler.joblib'
-FEATURES_PATH = 'ehr_features.json'
-TARGETS_PATH = 'ehr_targets.json'
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
 
-def load_artifacts():
-    print("--- Loading Artifacts ---")
-    # Load Scaler
-    scaler = joblib.load(SCALER_PATH)
-    
-    # Load Column Maps
-    with open(FEATURES_PATH, 'r') as f:
-        features = json.load(f)
-    with open(TARGETS_PATH, 'r') as f:
-        targets = json.load(f)
-        
-    # Load TFLite Model
-    interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-    interpreter.allocate_tensors()
-    
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-    
-    print(f"✅ Model Loaded. Input Shape: {input_details[0]['shape']}")
-    return scaler, features, targets, interpreter, input_details, output_details
+from ehr_tflite_map import MAP_FILE, load_mapping, make_interpreter  # noqa: E402
+from ehr_vectorize import pretty_target  # noqa: E402
 
-def encode_data(df):
-    """Must match the training logic exactly."""
-    if 'gender' in df.columns:
-        df['gender'] = df['gender'].map({'male': 1, 'female': 0}).fillna(0).astype('int8')
-    return df
 
-def generate_dummy_patient(features):
-    """Creates a random patient dataframe matching the training columns."""
-    data = {}
-    for col in features:
-        # Create random realistic values based on column name hints
-        if 'age' in col: val = np.random.randint(20, 90)
-        elif 'heart_rate' in col: val = np.random.randint(50, 120)
-        elif 'sbp' in col: val = np.random.randint(90, 180)
-        elif 'gender' in col: val = 'male' # Will be encoded
-        elif 'history_' in col or 'risk_' in col: val = np.random.choice([0, 1])
-        else: val = np.random.random() # Generic labs
-        data[col] = [val]
-    return pd.DataFrame(data)
+def score_tflite(interpreter, mapping, x_scaled):
+    """Run each row of x_scaled; return ({target: max prob over rows}, per-row latencies ms)."""
+    inp = interpreter.get_input_details()[0]
+    outputs = interpreter.get_output_details()
+    best, latencies = {}, []
+    for row in x_scaled:
+        interpreter.set_tensor(inp["index"], row[None, :].astype(np.float32))
+        t0 = time.perf_counter()
+        interpreter.invoke()
+        latencies.append((time.perf_counter() - t0) * 1000)
+        for d in outputs:
+            target = mapping[d["index"]]
+            val = float(interpreter.get_tensor(d["index"]).reshape(-1)[0])
+            best[target] = max(best.get(target, 0.0), val)
+    return best, latencies
 
-def run_inference(interpreter, input_data, input_details, output_details, targets):
-    # 1. Set Input
-    interpreter.set_tensor(input_details[0]['index'], input_data)
-    
-    # 2. Run Inference
-    start_time = time.time()
-    interpreter.invoke()
-    end_time = time.time()
-    
-    # 3. Get Outputs
-    results = {}
-    # TFLite outputs might not be in the same order as your targets list
-    # We map them by index if the model has multiple outputs
-    for i, detail in enumerate(output_details):
-        # The model outputs a list of arrays. 
-        # We assume the order matches the training target list if compiled correctly.
-        # Ideally, we verify tensor names, but TFLite cleans names.
-        # For this test, we map strictly by index order.
-        if i < len(targets):
-            pred = interpreter.get_tensor(detail['index'])[0][0]
-            results[targets[i]] = pred
-            
-    return results, (end_time - start_time) * 1000 # ms
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--patient", default="101")
+    parser.add_argument("--runs", type=int, default=100, help="timed inference runs")
+    parser.add_argument("--no-compare", action="store_true", help="skip loading the Keras model for comparison")
+    args = parser.parse_args()
+
+    if not os.path.exists(MAP_FILE):
+        sys.exit(f"{MAP_FILE} not found. Run `python ehr_tflite_map.py` first to recover the output order.")
+    mapping = load_mapping()
+
+    # Keras engine gives us the training-shaped observation rows and, optionally, reference scores.
+    from ehr_engine import EHRRiskEngine
+    engine = EHRRiskEngine()
+    with open(os.path.join(HERE, "EHR_patient_records.json")) as f:
+        record = json.load(f)[args.patient]
+    keras_result = engine.score(record)
+
+    from ehr_vectorize import build_feature_vector
+    rows = [build_feature_vector(row, engine.features)[0]
+            for label, row in engine._observation_rows(record)
+            if label == "demographics+history" or label in engine.features]
+    x = engine.scaler.transform(np.concatenate(rows)).astype(np.float32)
+    x[:, engine._unsupported_idx] = 0.0
+
+    interpreter = make_interpreter(os.path.join(HERE, "ehr_model.tflite"))
+    print(f"TFLite model loaded; input shape {interpreter.get_input_details()[0]['shape']}, "
+          f"{len(mapping)} outputs mapped\n")
+
+    print(f"--- Warm-up on {len(x)} observation rows for patient {args.patient} ({record['name']}) ---")
+    score_tflite(interpreter, mapping, x)
+
+    print(f"--- Timing {args.runs} single-row inferences ---")
+    single = x[:1]
+    latencies = []
+    for _ in range(args.runs):
+        _, lat = score_tflite(interpreter, mapping, single)
+        latencies += lat
+    print(f"TFLite latency: mean {np.mean(latencies):.3f} ms, p95 {np.percentile(latencies, 95):.3f} ms per row\n")
+
+    risks, _ = score_tflite(interpreter, mapping, x)
+    print("--- Top 5 risks (TFLite) ---")
+    for name, prob in sorted(risks.items(), key=lambda kv: -kv[1])[:5]:
+        line = f"{pretty_target(name):<26} {prob:7.2%}"
+        if not args.no_compare:
+            line += f"   Keras {keras_result.risks[name]:7.2%}"
+        print(line)
+
+    if not args.no_compare:
+        diffs = [abs(risks[t] - keras_result.risks[t]) for t in engine.targets]
+        print(f"\nMax |TFLite - Keras| over all {len(diffs)} heads: {max(diffs):.4f} "
+              "(drift is expected from TFLite weight quantisation; labels are what matter)")
+        top = lambda d: {k for k, _ in sorted(d.items(), key=lambda kv: -kv[1])[:5]}  # noqa: E731
+        if top(risks) != top(keras_result.risks):
+            sys.exit("TFLite and Keras disagree on the top-5 risks - the output mapping is stale; "
+                     "re-run ehr_tflite_map.py")
+        print("TFLite output labels agree with Keras (same top-5 risks).")
+
 
 if __name__ == "__main__":
-    # 1. Setup
-    scaler, features, targets, interpreter, input_details, output_details = load_artifacts()
-    
-    # 2. Create Dummy Data
-    print("\n--- Generating Test Patient ---")
-    raw_patient = generate_dummy_patient(features)
-    print("Raw Patient Data (First 5 cols):")
-    print(raw_patient.iloc[:, :5])
-    
-    # 3. Preprocess
-    # Align columns -> Encode -> FillNA -> Scale -> Float32
-    processed_df = raw_patient.reindex(columns=features).fillna(0)
-    processed_df = encode_data(processed_df)
-    input_data = scaler.transform(processed_df).astype('float32')
-    
-    # 4. Warmup Run (The first run is always slow due to initialization)
-    print("\n--- Warming up Engine ---")
-    _, _ = run_inference(interpreter, input_data, input_details, output_details, targets)
-    
-    # 5. Performance Test Loop
-    print("\n--- Starting Performance Test (100 runs) ---")
-    latencies = []
-    predictions = {}
-    
-    for _ in range(100):
-        preds, lat = run_inference(interpreter, input_data, input_details, output_details, targets)
-        latencies.append(lat)
-        predictions = preds # Save last result
-        
-    avg_lat = np.mean(latencies)
-    print(f"✅ Average Inference Speed: {avg_lat:.2f} ms per patient")
-    
-    # 6. Show Prediction Results
-    print("\n--- Top 5 Predicted Risks for Dummy Patient ---")
-    # Sort by probability
-    sorted_risks = sorted(predictions.items(), key=lambda x: x[1], reverse=True)
-    for name, prob in sorted_risks[:5]:
-        print(f"{name}: {prob:.2%}")
+    main()

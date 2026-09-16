@@ -92,3 +92,8 @@ with open('ehr_model.tflite', 'wb') as f:
     f.write(tflite_model)
 
 print("✅ TFLite model saved. Ready for Jetson Nano/RPi.")
+
+# TFLite does not keep the 51 heads in order; recover the mapping now so
+# test_ehr_performance.py and the edge deployment label outputs correctly.
+import subprocess, sys
+subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ehr_tflite_map.py')], check=True)

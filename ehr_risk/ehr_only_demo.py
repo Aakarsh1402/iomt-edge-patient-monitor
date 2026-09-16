@@ -12,22 +12,21 @@ import json
 import os
 import sys
 
-from ehr_engine import HERE, EHRRiskEngine
+from ehr_engine import HERE, KEY_RISKS, EHRRiskEngine
 from ehr_vectorize import map_history, pretty_target, top_risks
 
 PATIENT_DB = os.path.join(HERE, "EHR_patient_records.json")
 
 
-def print_summary(record, result):
+def print_summary(engine, record, result):
     key = result.key_risks()
     print(f"   Name: {record['name']}   (age {record['age']}, {record['gender']})")
     print(f"   Inference time: {result.latency_ms:.1f} ms for {result.n_rows} observation rows")
     print("-" * 40)
-    print(f"   Fall risk:     {key['fall'] * 100:5.1f}%")
-    print(f"   Seizure risk:  {key['seizure'] * 100:5.1f}%")
-    print(f"   Cardiac risk:  {key['cardiac'] * 100:5.1f}%")
-    print(f"   Sepsis risk:   {key['sepsis'] * 100:5.1f}%")
-    print(f"   Stroke risk:   {key['stroke'] * 100:5.1f}%")
+    for label, short in [("Fall", "fall"), ("Seizure", "seizure"), ("Cardiac", "cardiac"),
+                         ("Sepsis", "sepsis"), ("Stroke", "stroke")]:
+        note = "  (head never fired in training - not a verdict)" if KEY_RISKS[short] in engine.untrained_heads else ""
+        print(f"   {label + ' risk:':<15}{key[short] * 100:5.1f}%{note}")
     print("-" * 40)
     for w in result.warnings:
         print(f"   ! {w}")
@@ -54,6 +53,9 @@ def print_deep_dive(engine, record, result, top_n):
     for i, (name, prob) in enumerate(top_risks(risks.values(), list(risks), top_n), 1):
         bar = "#" * int(prob * 20)
         print(f"   {i:>2}. {pretty_target(name):<26} |{bar:<20}| {prob * 100:6.2f}%")
+    if engine.untrained_heads:
+        print(f"   ({len(engine.untrained_heads)} of {len(engine.targets)} heads never fired in training "
+              "and always read 0%; see ehr_tflite_outputs.json)")
     print("=" * 50 + "\n")
 
 
@@ -93,7 +95,7 @@ def main():
         record = patient_db[pid]
         print(f"\nPATIENT {pid}")
         result = engine.score(record)
-        print_summary(record, result)
+        print_summary(engine, record, result)
         return record, result
 
     if args.all:

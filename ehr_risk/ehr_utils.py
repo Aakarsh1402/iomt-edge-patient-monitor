@@ -64,11 +64,11 @@ def data_generator(file_list, scaler, feature_cols, target_cols, batch_size):
                 else:
                     yield X_scaled, tuple(y_list)
 
-            # Aggressive Cleanup
+            # Aggressive Cleanup. (Do NOT call keras.backend.clear_session()
+            # here: it resets Keras global state from inside model.fit().)
             del df
             del batch_df
-            gc.collect() 
-            tf.keras.backend.clear_session() # Helper to clear graph clutter
+            gc.collect()
 
 def set_gpu_memory_growth():
     """Sets up Mixed Precision and Memory Growth."""
