@@ -1,24 +1,30 @@
 # Core ML
-tensorflow>=2.16
-torch>=2.1
+tensorflow>=2.16          # EHR risk engine, arrhythmia model (TFLite runtime included)
+torch>=2.1                # IMU motion classifier, vision classifier
 torchvision>=0.16
 scikit-learn>=1.3
+scipy>=1.10               # TFLite output-order recovery
 
 # Data handling
 numpy>=1.26
 pandas>=2.1
-pyarrow>=14.0
+pyarrow>=14.0             # EHR preprocessing (Parquet)
 joblib>=1.3
 
 # ECG tooling (arrhythmia notebook)
 wfdb>=4.1
 neurokit2>=0.2
 
-# Vision / webcam demo
-opencv-python>=4.8
+# Vision
+opencv-python>=4.8        # swap for opencv-python-headless on machines without a display
 pillow>=10.0
 
 # Plots
 matplotlib>=3.8
-seaborn>=0.13
-plotly>=5.18
+plotly>=5.18              # arrhythmia notebook dashboard
+
+# Live IMU stream for fusion/run_monitor.py --live (optional)
+paho-mqtt>=1.6
+
+# Tests
+pytest>=7.0

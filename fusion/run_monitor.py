@@ -74,7 +74,11 @@ def simulated_windows():
 
 
 def live_windows(broker, topic, port):
-    """Yield windows assembled from IMU samples published by the ESP32 node."""
+    """Yield windows assembled from `ax,ay,az` messages (g, 50 Hz) on an MQTT topic.
+
+    Note: the shipped ecg_imu_node firmware only publishes a 1 Hz dashboard
+    line to test/sensors; a 50 Hz accelerometer publish is a small addition.
+    """
     import paho.mqtt.client as mqtt  # optional dependency
 
     from ward_model import WINDOW_SIZE
