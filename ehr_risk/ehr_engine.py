@@ -80,6 +80,13 @@ class EHRRiskEngine:
                 f"Scaler expects {n_in} features but ehr_features.json lists {len(self.features)}; "
                 "the artifacts come from different training runs."
             )
+        # The scaler was fitted on a DataFrame; check its column order is ours,
+        # then drop the names so transform() accepts plain arrays silently.
+        names = getattr(self.scaler, "feature_names_in_", None)
+        if names is not None:
+            if list(names) != list(self.features):
+                raise ValueError("Scaler column order differs from ehr_features.json")
+            del self.scaler.feature_names_in_
         # Features that were constant across the whole training set.
         self.unsupported = [f for f, v in zip(self.features, self.scaler.var_) if v == 0]
         self._unsupported_idx = [self.features.index(f) for f in self.unsupported]

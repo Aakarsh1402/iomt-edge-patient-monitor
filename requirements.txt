@@ -1,30 +1,32 @@
-# Core ML
-tensorflow>=2.16          # EHR risk engine, arrhythmia model (TFLite runtime included)
-torch>=2.1                # IMU motion classifier, vision classifier
-torchvision>=0.16
-scikit-learn>=1.3
-scipy>=1.10               # TFLite output-order recovery
+# Everything runs on CPU; no GPU, broker or hardware needed.
+#   pip install -r requirements.txt
+# On a machine without a display use opencv-python-headless instead of opencv-python.
 
-# Data handling
+# Models
+tensorflow>=2.16          # EHR risk engine + arrhythmia model (TFLite runtime included); use tensorflow-cpu for a smaller install
+torch>=2.1                # IMU motion classifier, vision classifier (CPU wheels: --index-url https://download.pytorch.org/whl/cpu)
+torchvision>=0.16
+scikit-learn>=1.3         # metrics, EHR scaler
+scipy>=1.10               # ECG baseline filter, TFLite output-order recovery
+
+# Data
 numpy>=1.26
 pandas>=2.1
-pyarrow>=14.0             # EHR preprocessing (Parquet)
 joblib>=1.3
 
-# ECG tooling (arrhythmia notebook)
-wfdb>=4.1
-neurokit2>=0.2
-
 # Vision
-opencv-python>=4.8        # swap for opencv-python-headless on machines without a display
+opencv-python>=4.8
 pillow>=10.0
 
-# Plots
+# Live pipeline (MQTT client; the broker is fusion/mini_broker.py or Mosquitto)
+paho-mqtt>=2.0
+
+# Plots + tests
 matplotlib>=3.8
-plotly>=5.18              # arrhythmia notebook dashboard
-
-# Live IMU stream for fusion/run_monitor.py --live (optional)
-paho-mqtt>=1.6
-
-# Tests
 pytest>=7.0
+
+# Only for retraining the EHR model from a FHIR corpus / the original Colab notebook
+# pyarrow>=14.0
+# wfdb>=4.1
+# neurokit2>=0.2
+# plotly>=5.18
