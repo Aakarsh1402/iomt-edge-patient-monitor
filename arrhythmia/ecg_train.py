@@ -148,8 +148,14 @@ def main():
                    if "auc" in r else f"false-positive rate {r['false_positive_rate']:.3f}")
         print(f"  {name:<20} n={r['n']:<5} {summary}")
 
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    with open(os.path.join(RESULTS_DIR, "ecg_training.json"), "w") as f:
+    # Experiments (--out elsewhere) keep their results next to the model, so
+    # they never overwrite the checked-in numbers for ecg_model.keras.
+    if os.path.abspath(args.out) == os.path.abspath(DEFAULT_MODEL_FILE):
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        stem = os.path.join(RESULTS_DIR, "ecg_training")
+    else:
+        stem = os.path.splitext(args.out)[0] + "_training"
+    with open(stem + ".json", "w") as f:
         json.dump(results, f, indent=2)
 
     import matplotlib
@@ -161,8 +167,8 @@ def main():
         ax.plot(history.history["val_" + key], label="val")
         ax.set_title(key); ax.set_xlabel("epoch"); ax.legend(); ax.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(os.path.join(RESULTS_DIR, "ecg_training.png"), dpi=110)
-    print(f"Wrote {RESULTS_DIR}/ecg_training.json and ecg_training.png")
+    fig.savefig(stem + ".png", dpi=110)
+    print(f"Wrote {stem}.json and {stem}.png")
 
 
 if __name__ == "__main__":
