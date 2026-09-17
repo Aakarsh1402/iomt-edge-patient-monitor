@@ -1,5 +1,7 @@
 # IoMT Edge Patient Monitor
 
+[![checks](https://github.com/Aakarsh1402/iomt-edge-patient-monitor/actions/workflows/checks.yml/badge.svg)](https://github.com/Aakarsh1402/iomt-edge-patient-monitor/actions/workflows/checks.yml)
+
 **An autonomous, multimodal edge-AI system for continuous patient monitoring and triage.**
 
 Hospital staff cannot watch every patient 24×7, and the automated systems that exist (bed alarms, fall detectors) generate so many false positives that nurses learn to ignore them. This project is an Internet of Medical Things (IoMT) prototype that tackles both problems: a wearable ESP32 edge node streams ECG and motion data over MQTT into a time-series pipeline, and three AI modalities — **ECG arrhythmia detection**, **EHR-based clinical risk prediction**, and **motion/vision-based event recognition** — are fused so that staff are alerted only when an anomaly is corroborated by more than one signal.
@@ -113,7 +115,7 @@ pip install -r requirements.txt                          # CPU-only TensorFlow +
 python run_checks.py                                     # ~1 min: tests + every model + both demos
 ```
 
-`run_checks.py` runs the 74-test `pytest` suite, the IMU and ECG held-out evaluations, the EHR demo and TFLite check, the vision checkpoint load, the scripted fusion scenario and the live MQTT pipeline, and prints a scoreboard. Steps whose optional dependency is missing are skipped rather than failed, so a PyTorch-only or TensorFlow-only machine still gets a result. `python -m pytest tests -q` alone takes ~10 s.
+`run_checks.py` runs the 74-test `pytest` suite, the IMU and ECG held-out evaluations, the EHR demo and TFLite check, the vision checkpoint load, the scripted fusion scenario and the live MQTT pipeline, and prints a scoreboard. Steps whose optional dependency is missing are skipped rather than failed, so a PyTorch-only or TensorFlow-only machine still gets a result. `python -m pytest tests -q` alone takes ~10 s. The same script runs in GitHub Actions on every push ([`.github/workflows/checks.yml`](.github/workflows/checks.yml)) on a stock Ubuntu runner with CPU-only wheels — the badge at the top of this page is its latest result, and it takes about 3 minutes including installs.
 
 ### End-to-end ward monitor
 
