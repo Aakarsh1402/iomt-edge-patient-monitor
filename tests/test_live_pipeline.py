@@ -37,17 +37,19 @@ def test_live_monitor_pages_on_the_fall(capsys):
             client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="node")
             client.connect("127.0.0.1", broker.port)
             client.loop_start()
-            time.sleep(0.5)                        # let the monitor subscribe first
             for _t, topic, payload in scenario_events():
                 client.publish(topic, payload)
                 time.sleep(0.0005)
             client.loop_stop()
             client.disconnect()
 
+        # Start publishing only once the monitor has subscribed: on a cold
+        # start loading torch can take seconds, and a fixed delay would let
+        # the node's (non-retained) samples go out before anyone listens.
         t = threading.Thread(target=publish, daemon=True)
-        t.start()
         pages = run_monitor.main(["--live", "--no-ehr", "--no-ecg", "--no-color", "--broker", "127.0.0.1",
-                                  "--port", str(broker.port), "--max-windows", "18", "--idle-timeout", "5"])
+                                  "--port", str(broker.port), "--max-windows", "18", "--idle-timeout", "5"],
+                                 on_subscribed=t.start)
         t.join(10)
 
     out = capsys.readouterr().out
