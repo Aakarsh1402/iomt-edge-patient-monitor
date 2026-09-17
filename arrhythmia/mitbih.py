@@ -5,7 +5,12 @@ the beat annotations are the original PhysioNet `.atr` files, which are tiny.
 This module parses them without depending on the wfdb package.
 
     from mitbih import records, load_record
-    sig, beats = load_record("208")       # beats: list of (sample_index, symbol)
+    sig, ann = load_record("208")         # ann: list of (sample_index, symbol, aux)
+
+Beat symbols mark ectopic beats (V, A, ...). Rhythm changes are `+` marks
+whose aux text names the new rhythm - "(N" normal, "(AFIB", "(VT", "(B" ...
+- and a window inside an abnormal rhythm is arrhythmic even if every beat in
+it is a plain "N"; label_windows() accounts for both.
 """
 import os
 
@@ -19,6 +24,8 @@ SAMPLE_RATE = 360
 
 # Beat symbols that count as arrhythmic, as in the training notebook.
 ARRHYTHMIA_SYMBOLS = frozenset("VEAJSFaej")
+# Rhythm labels that are not arrhythmias.
+NORMAL_RHYTHMS = frozenset(["(N", ""])
 # Symbols that mark beats at all (the rest are rhythm/quality/comment marks).
 BEAT_SYMBOLS = frozenset("NLRaVFJASEj/Qfe!")
 
@@ -45,11 +52,12 @@ def records(signal_dir=SIGNAL_DIR):
 
 
 def read_annotations(path):
-    """Parse a PhysioNet .atr file into a list of (sample_index, symbol).
+    """Parse a PhysioNet .atr file into a list of (sample_index, symbol, aux).
 
     Each entry is a little-endian 16-bit word: the top 6 bits are the
     annotation code, the low 10 bits the interval since the previous
-    annotation. Codes 59-63 are escapes (long skip, modifiers, aux text).
+    annotation. Codes 59-63 are escapes (long skip, modifiers, aux text);
+    aux text belongs to the annotation just before it.
     """
     words = np.fromfile(path, dtype="<u2")
     out, t, pending_skip, i = [], 0, 0, 0
@@ -64,11 +72,15 @@ def read_annotations(path):
         elif code in (_NUM, _SUB, _CHN):
             continue
         elif code == _AUX:
-            i += (interval + 1) // 2
+            n_words = (interval + 1) // 2
+            text = words[i:i + n_words].tobytes()[:interval].rstrip(b"\x00").decode(errors="replace")
+            i += n_words
+            if out:
+                out[-1] = out[-1][:2] + (text,)
         else:
             t += interval + pending_skip
             pending_skip = 0
-            out.append((t, _CODE_TO_SYMBOL.get(code, "?")))
+            out.append((t, _CODE_TO_SYMBOL.get(code, "?"), ""))
     return out
 
 
@@ -79,12 +91,31 @@ def load_record(name, signal_dir=SIGNAL_DIR, annotation_dir=ANNOTATION_DIR):
     return sig, beats
 
 
-def label_windows(beats, n_samples, window_size, stride, min_ectopic=2):
-    """Yield (start, label) for every window; label is 1 (>= min_ectopic
-    arrhythmic beats), 0 (none) or None (ambiguous: fewer than min_ectopic)."""
-    samples = np.array([s for s, _ in beats])
-    ectopic = np.array([sym in ARRHYTHMIA_SYMBOLS for _, sym in beats])
+def rhythm_segments(annotations, n_samples):
+    """[(start, end, rhythm)] covering the record, from the `+` marks."""
+    changes = [(s, aux) for s, sym, aux in annotations if sym == "+"]
+    if not changes or changes[0][0] > 0:
+        changes.insert(0, (0, changes[0][1] if changes else "(N"))
+    return [(s, changes[i + 1][0] if i + 1 < len(changes) else n_samples, r)
+            for i, (s, r) in enumerate(changes)]
+
+
+def label_windows(annotations, n_samples, window_size, stride, min_ectopic=2):
+    """Yield (start, label) for every window.
+
+    1    at least min_ectopic ectopic beats, or any part of the window lies in
+         an abnormal rhythm (AFIB, VT, bigeminy, ...)
+    0    normal rhythm throughout and no ectopic beat
+    None ambiguous: normal rhythm with fewer than min_ectopic ectopic beats
+    """
+    samples = np.array([s for s, _, _ in annotations])
+    ectopic = np.array([sym in ARRHYTHMIA_SYMBOLS for _, sym, _ in annotations])
+    abnormal = [(a, b) for a, b, r in rhythm_segments(annotations, n_samples) if r not in NORMAL_RHYTHMS]
     for start in range(0, n_samples - window_size + 1, stride):
-        mask = (samples >= start) & (samples < start + window_size)
+        end = start + window_size
+        if any(a < end and b > start for a, b in abnormal):
+            yield start, 1
+            continue
+        mask = (samples >= start) & (samples < end)
         n = int(ectopic[mask].sum())
         yield start, (1 if n >= min_ectopic else 0 if n == 0 else None)

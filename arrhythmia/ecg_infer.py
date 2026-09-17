@@ -2,10 +2,11 @@
 
     python ecg_infer.py raw_data/collected/normal/2025-11-25_20-04-09-Aakarsh.csv
     python ecg_infer.py raw_data/collected/            # every CSV underneath, grouped by folder
-    python ecg_infer.py recording.csv --model finetuned.keras --scale 1.0
+    python ecg_infer.py raw_data/mitbih/arrhythmia/233.csv   # MIT-BIH record (mV)
+    python ecg_infer.py recording.csv --model base_model      # the old notebook model
 
-Exit status is 0. See ecg_model.py for what the bundled base model can and
-cannot do with raw sensor data.
+Sensor ADC counts and MIT-BIH millivolts are both fine: every window is
+normalised before inference (see ecg_model.preprocess_windows).
 """
 import argparse
 import os
@@ -15,7 +16,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from ecg_model import ADC_COUNTS_TO_MV, ArrhythmiaDetector, load_ecg_csv  # noqa: E402
+from ecg_model import ArrhythmiaDetector, load_ecg_csv  # noqa: E402
 
 
 def collect_csvs(paths):
@@ -32,14 +33,12 @@ def collect_csvs(paths):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("paths", nargs="+", help="CSV files or directories")
-    parser.add_argument("--model", help=".keras file or model directory (default: bundled base_model/)")
-    parser.add_argument("--scale", type=float, default=ADC_COUNTS_TO_MV,
-                        help="multiply input by this before inference (default: ADC counts -> mV)")
+    parser.add_argument("--model", help=".keras file or model directory (default: ecg_model.keras)")
     parser.add_argument("--threshold", type=float, default=0.5)
     args = parser.parse_args()
 
-    detector = ArrhythmiaDetector(args.model, args.scale)
-    print(f"Model: {detector.model_path}  (window {detector.window_size} samples, scale {args.scale:g})\n")
+    detector = ArrhythmiaDetector(args.model)
+    print(f"Model: {detector.model_path}  (window {detector.window_size} samples)\n")
 
     by_group = {}
     print(f"{'file':<58}{'windows':>8}{'mean P':>8}{'max P':>8}  verdict")
