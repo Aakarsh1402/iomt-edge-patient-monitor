@@ -4,6 +4,8 @@
 
 Hospital staff cannot watch every patient 24×7, and the automated systems that exist (bed alarms, fall detectors) generate so many false positives that nurses learn to ignore them. This project is an Internet of Medical Things (IoMT) prototype that tackles both problems: a wearable ESP32 edge node streams ECG and motion data over MQTT into a time-series pipeline, and three AI modalities — **ECG arrhythmia detection**, **EHR-based clinical risk prediction**, and **motion/vision-based event recognition** — are fused so that staff are alerted only when an anomaly is corroborated by more than one signal.
 
+**Runs on a laptop.** Every model, the MQTT pipeline and the alert fusion run on a CPU with no hardware, broker or GPU — `python run_checks.py` exercises all of it in about a minute.
+
 > Built by Team AJAS — Aakarsh Mishra, Joshua Koilpillai, Aayush Khatanhar, Saharsh Kallu (with data-collection help from Ronith and Lohith). Full write-up in [`docs/IoMT_Project_Report.pdf`](docs/IoMT_Project_Report.pdf); slides in [`docs/IoMT_Presentation.pptx`](docs/IoMT_Presentation.pptx).
 
 ---
@@ -45,12 +47,13 @@ Hospital staff cannot watch every patient 24×7, and the automated systems that 
 |---|---|
 | [`firmware/ecg_imu_node/`](firmware/ecg_imu_node/) | ESP32 sketch: samples the AD8232 at 360 Hz, filters it, batches 1-second windows to `test/ecg_raw`; reads the MPU6050 and publishes a 1 Hz dashboard line to `test/sensors`; contains impact + stillness fall-detection heuristics. |
 | [`firmware/camera_webserver/`](firmware/camera_webserver/) | ESP32-CAM MJPEG streaming server (based on the Espressif example) used as the visual input for the vision model. |
-| [`arrhythmia/`](arrhythmia/) | ECG arrhythmia classifier — Colab notebook, trained base model weights, MIT-BIH + self-collected datasets, training/validation plots. |
+| [`arrhythmia/`](arrhythmia/) | ECG arrhythmia classifier — local training (`ecg_train.py`), inter-patient evaluation, CLI scoring, the trained `ecg_model.keras`, MIT-BIH (signals + beat annotations) and self-collected AD8232 recordings. |
 | [`ehr_risk/`](ehr_risk/) | EHR clinical-risk engine — FHIR preprocessing, multi-task Keras model, TFLite export, standalone demo. |
 | [`gesture_recognition/`](gesture_recognition/) | IMU motion classifier (1-D CNN in PyTorch) for falls, seizures, agitation, etc. |
 | [`vision/`](vision/) | MobileNetV3-Small fine-tuned to classify camera frames as *Normal / Distress / Danger*; runner for webcam, video, images or the ESP32-CAM stream. |
-| [`fusion/`](fusion/) | The alert-fusion engine (corroboration rules, alert levels) and `run_monitor.py`, which drives the real IMU + EHR models end to end. |
-| [`tests/`](tests/) | `pytest` suite for the fusion rules, EHR encoding and ECG loading — none of it needs TensorFlow or hardware. |
+| [`fusion/`](fusion/) | The alert-fusion engine (corroboration rules, alert levels), `run_monitor.py` (scripted or live over MQTT), a simulated ESP32 node, a pure-Python MQTT broker and `live_demo.py` which wires them together. |
+| [`tests/`](tests/) | `pytest` suite: fusion rules, MQTT broker, MIT-BIH parsing, EHR encoding + engine, and every model checkpoint. |
+| [`run_checks.py`](run_checks.py) | Runs the tests plus each module's evaluation and both demos, with a pass/fail scoreboard. |
 | [`docs/`](docs/) | Project report and presentation. |
 
 ---
@@ -59,16 +62,16 @@ Hospital staff cannot watch every patient 24×7, and the automated systems that 
 
 ### 1. Arrhythmia detection (`arrhythmia/`)
 
-A 1-D CNN (Conv 32 → 64 → 128 with BatchNorm, MaxPool and Dropout, then global-average-pooling and a sigmoid head) classifies ECG windows as normal vs. arrhythmic. The bundled base model takes 10-second (3600-sample) windows of raw millivolt ECG; the fine-tuning stage re-windows to 1 second (360 samples).
+A 1-D CNN over 10-second (3600-sample, 360 Hz) ECG windows outputs P(arrhythmia). Four conv blocks with early pooling and a dilated last block give a ~2.5 s receptive field, so the network sees rhythm as well as beat shape; 209 k parameters, trains in ~2 min on a laptop CPU.
 
-- **Data.** 48 records from the [MIT-BIH Arrhythmia Database](https://physionet.org/content/mitdb/) (exported to CSV with beat annotations in `raw_data/mitbih/`), plus 120 ten-second recordings collected from team members with our own AD8232 node (`raw_data/collected/normal/`). To obtain "abnormal" rhythms safely, team members recorded after bursts of strenuous exercise (`raw_data/collected/arrhythmia/`).
-- **Training.** Two-stage *domain adaptation*: a base model is trained on MIT-BIH, then fine-tuned on the low-cost-sensor data so it generalises to our hardware. Class-weighted loss handles the heavy normal/arrhythmia imbalance; early stopping monitors validation AUC.
-- **Results.** Base model on MIT-BIH held-out test: **AUC 0.93**. After fine-tuning on sensor data: **accuracy 99.6 %, AUC 0.999** on the sensor test split (see `training_results/training_summary.json`).
-- **What is checked in.** Only the stage-1 base model (`base_model/`, Keras 3 config + weights). The fine-tuned sensor weights behind the 99.6 % figure are not in the repo, and the base model alone scores every AD8232 recording as normal — `ecg_infer.py` runs it anyway so the fine-tuned checkpoint can drop in via `--model`.
+- **Data.** 48 records of the [MIT-BIH Arrhythmia Database](https://physionet.org/content/mitdb/) (signals as CSV, original `.atr` beat annotations parsed by `mitbih.py`), plus 120 ten-second recordings from four team members on our own AD8232 node (`raw_data/collected/normal/`). A window is *arrhythmic* if it lies in an abnormal rhythm (AFIB, flutter, VT, bigeminy, …) or holds ≥ 2 ectopic beats; windows with a single ectopic beat are dropped as ambiguous.
+- **Protocol (`ecg_train.py`).** Inter-patient split of de Chazal et al.: DS1 records train (4 held out for early stopping), DS2 records test, so no patient appears on both sides. Sensor recordings are split by *volunteer* (two train, two test). Every window is baseline-corrected and scaled to unit variance before the network (`preprocess_windows`), which makes ADC counts from the sensor and millivolts from MIT-BIH interchangeable. Augmentation: random polarity flip and white noise up to the sensor's level.
+- **Results (`ecg_evaluate.py`, `training_results/ecg_training.json`).** On the 22 unseen DS2 patients: **AUC 0.92, sensitivity 0.90, specificity 0.77** at threshold 0.5. On the 44 normal recordings from the two held-out volunteers: **0 false positives**. The main failure mode is morphology, not rhythm: two normal DS2 records with unusual T waves (113, 117) are flagged throughout. The three post-exercise recordings (~140 bpm) score 0.96–0.99; they were never labelled by a clinician, so that is reported but not claimed.
+- **What is checked in.** `ecg_model.keras` (2.6 MB) and the exact protocol that produced it. The older notebook model (`base_model/`, `ecg.ipynb`) is kept for reference: it fed raw millivolts through a scaler it never saved and split overlapping windows at random, so its 0.93 AUC did not survive contact with unseen patients or the sensor.
 
-| Training curves (base) | Fine-tuning curves |
+| Training curves | Held-out sensor recordings are scored, not just MIT-BIH |
 |---|---|
-| ![](arrhythmia/training_results/training_base.png) | ![](arrhythmia/training_results/training_finetune.png) |
+| ![](arrhythmia/training_results/ecg_training.png) | `python arrhythmia/ecg_infer.py arrhythmia/raw_data/collected` → normal 0/120 flagged |
 
 ### 2. EHR risk prediction (`ehr_risk/`)
 
@@ -85,7 +88,7 @@ A multi-task neural network that reads a patient's recent history and outputs a 
 This modality exists to kill false alarms. A motion event flagged by the IMU is only escalated if the camera agrees.
 
 - **IMU classifier.** A compact 1-D CNN (`WardGuardianCNN`) over 1.5 s windows (75 samples @ 50 Hz, 3-axis accelerometer) predicting 12 states: lying, sitting, walking, **fall**, **seizure**, slump, agitation, choking, vomiting, CPR-in-progress, respiratory distress, transport. Walking and fall windows come from the [SisFall](https://www.mdpi.com/1424-8220/17/1/198) dataset with a *subject-aware* split (test subjects never seen in training); the remaining classes are generated from physics-inspired synthetic signals. `sanity_check.py` probes the model with hand-crafted signals; `evaluate_model.py` produces the confusion matrix.
-- **Vision classifier.** MobileNetV3-Small (ImageNet-pretrained; last three feature blocks + head fine-tuned) with heavy augmentation to cope with odd CCTV-like angles. Classifies frames into *Normal / Distress / Danger*. `run_webcam.py` runs it live on a webcam or the ESP32-CAM stream.
+- **Vision classifier.** MobileNetV3-Small (ImageNet-pretrained; last three feature blocks + head fine-tuned) with heavy augmentation to cope with odd CCTV-like angles. Classifies frames into *Normal / Distress / Danger*. `run_vision.py` runs it on a webcam, video file, image folder or the ESP32-CAM stream, and `--publish` sends each verdict to MQTT for the fusion monitor.
 
 | IMU model — confusion matrix | Vision model — training metrics |
 |---|---|
@@ -96,7 +99,7 @@ This modality exists to kill false alarms. A motion event flagged by the IMU is 
 - a **single uncorroborated sensor** is capped below the paging threshold — restlessness alone is a WATCH, restlessness plus a camera "Distress" verdict is an ALERT;
 - a **critical event** (fall, seizure, choking, CPR) pages on its own, but only when the classifier is ≥ 75 % confident — a 56 % "FALL" on a patient rolling over stays a WATCH until a second sensor agrees.
 
-Alert levels are `OK / INFO / WATCH / ALERT / CRITICAL`; `ALERT` and above page the nurse. `fusion/run_monitor.py` runs the real IMU checkpoint and EHR model through a scripted ward scenario (or live IMU windows over MQTT), and `tests/test_fusion_engine.py` pins the rules down.
+Alert levels are `OK / INFO / WATCH / ALERT / CRITICAL`; `ALERT` and above page the nurse. `fusion/run_monitor.py` runs all three models through a scripted ward scenario — IMU windows from the physics generators, real ECG (a held-out volunteer's AD8232 trace vs. a MIT-BIH test patient with PVCs), the EHR profile of the chosen patient — or, with `--live`, consumes the node's MQTT topics. `tests/test_fusion_engine.py` pins the rules down.
 
 ---
 
@@ -105,30 +108,41 @@ Alert levels are `OK / INFO / WATCH / ALERT / CRITICAL`; `ALERT` and above page 
 ### Python environment
 
 ```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python -m pytest tests/              # 40 tests; no TensorFlow, GPU or hardware needed
+python -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.txt                          # CPU-only TensorFlow + PyTorch are fine
+python run_checks.py                                     # ~1 min: tests + every model + both demos
 ```
+
+`run_checks.py` runs the 74-test `pytest` suite, the IMU and ECG held-out evaluations, the EHR demo and TFLite check, the vision checkpoint load, the scripted fusion scenario and the live MQTT pipeline, and prints a scoreboard. Steps whose optional dependency is missing are skipped rather than failed, so a PyTorch-only or TensorFlow-only machine still gets a result. `python -m pytest tests -q` alone takes ~10 s.
 
 ### End-to-end ward monitor
 
 ```bash
-python fusion/run_monitor.py                  # patient 101: EHR risk profile + IMU classifier + fusion
-python fusion/run_monitor.py --patient 102    # healthy patient: same motion, fewer pages
-python fusion/run_monitor.py --no-ehr         # PyTorch only, skips TensorFlow
-python fusion/run_monitor.py --live --broker 192.168.1.100 --topic test/imu_raw   # real IMU stream
+python fusion/run_monitor.py                  # patient 101: EHR profile + IMU + ECG + fusion, scripted scenario
+python fusion/run_monitor.py --patient 102    # healthy patient: same events, fewer pages
+python fusion/run_monitor.py --no-ehr --no-ecg   # PyTorch only, no TensorFlow
+python fusion/live_demo.py                    # the same thing over MQTT: broker + simulated node + monitor
 ```
 
-`--live` expects `ax,ay,az` messages in g at 50 Hz on the topic. The current `ecg_imu_node` sketch only publishes the 1 Hz dashboard line to `test/sensors` (too slow for a 1.5 s window), so a 50 Hz publish is a small firmware addition still to do.
+`live_demo.py` starts the pure-Python broker (`fusion/mini_broker.py`), a stand-in for the ESP32 node (`fusion/simulate_node.py`, which publishes `test/ecg_raw`, `test/imu_raw`, `test/sensors` and `test/vision` exactly as the hardware would) and the monitor in `--live` mode. To run the pieces separately, or against Mosquitto and a real node:
+
+```bash
+python fusion/mini_broker.py                  # or: docker run -p 1883:1883 eclipse-mosquitto
+python fusion/simulate_node.py --loop         # or flash firmware/ecg_imu_node and point it at the broker
+python vision/run_vision.py --source http://<esp32-cam>/stream --headless --publish localhost
+python fusion/run_monitor.py --live --broker localhost
+```
+
+**Hardware gap:** the shipped `ecg_imu_node` sketch has its IMU read disabled (the I²C transaction was stalling the 360 Hz ECG loop) and publishes only the 1 Hz dashboard line. A 50 Hz `ax,ay,az` publish on `test/imu_raw` — what the simulator sends — is the firmware change still needed to feed the motion classifier from the real node; the ECG path is already compatible.
 
 ### Arrhythmia model
 
-`arrhythmia/ecg.ipynb` is a Colab notebook: it downloads MIT-BIH via `wfdb`, trains the base model, and renders an interactive Plotly evaluation dashboard. Outside the notebook:
-
 ```bash
 cd arrhythmia
-python ecg_infer.py raw_data/collected/            # score every recording with the bundled base model
-python ecg_infer.py recording.csv --model finetuned.keras --scale 1.0   # a fine-tuned checkpoint, mV input
+python ecg_infer.py raw_data/collected/                 # score every sensor recording (ADC counts)
+python ecg_infer.py raw_data/mitbih/arrhythmia/233.csv  # a MIT-BIH record (mV) - same model, no flags
+python ecg_evaluate.py                                  # DS2 inter-patient metrics + held-out volunteers
+python ecg_train.py                                     # retrain from the checked-in data (~2 min CPU)
 ```
 
 ### EHR risk engine
@@ -174,18 +188,28 @@ Open either sketch folder in the Arduino IDE with the ESP32 board package instal
 
 ### Backend
 
-Any MQTT broker works (we used Mosquitto). A Telegraf `[[inputs.mqtt_consumer]]` subscribed to `test/sensors` (InfluxDB line protocol) and `test/ecg_raw` (CSV of 360 ints) feeds InfluxDB; Grafana reads from there.
+Any MQTT broker works — `fusion/mini_broker.py` for development, Mosquitto in deployment. A Telegraf `[[inputs.mqtt_consumer]]` subscribed to `test/sensors` (InfluxDB line protocol) and `test/ecg_raw` (CSV of 360 ints) feeds InfluxDB; Grafana reads from there.
 
 ---
 
 ## Engineering notes
 
-- **Sensor noise vs. medical-grade data.** The AD8232 on a 12-bit ADC is far noisier than the MIT-BIH recordings. The firmware does slow adaptive baseline tracking for DC-offset removal and a 7-tap moving-average filter before publishing; the model side compensates with the fine-tuning stage on real sensor data.
+- **Sensor noise vs. medical-grade data.** The AD8232 on a 12-bit ADC is far noisier than the MIT-BIH recordings. The firmware does slow adaptive baseline tracking for DC-offset removal and a 7-tap moving-average filter before publishing; the model side normalises every window (baseline subtraction, unit variance) so gain and offset differences vanish, trains with noise augmentation, and mixes real sensor recordings into the training set.
+- **Rhythm labels live in the aux text.** In MIT-BIH, atrial fibrillation is a run of plain `N` beats under a `(AFIB` rhythm mark; labelling windows by beat symbols alone calls it normal and then penalises the model for flagging it. `mitbih.py` parses the rhythm marks and `label_windows` uses both.
+- **Evaluate across patients, not across windows.** Overlapping windows from one record share beats; splitting them at random leaks the test set into training. The DS1/DS2 inter-patient split costs ~7 AUC points relative to the notebook's number and is the one to believe.
 - **Class imbalance.** Normal beats vastly outnumber arrhythmic ones; class-weighted loss and AUC-based early stopping replaced accuracy as the optimisation target after early models collapsed to the majority class.
 - **Out-of-core EHR training.** The FHIR corpus exceeded available RAM, so preprocessing writes chunked Parquet and training streams mini-batches from disk with aggressive dtype down-casting.
 - **Honest evaluation for motion data.** SisFall windows are split by *subject*, not randomly, so reported accuracy reflects unseen patients rather than memorised gait signatures. SisFall's waist sensor reads −1 g on Y when upright; synthetic probes must use the same orientation or "walking" is classified as sitting.
 - **Score the way you trained.** The EHR model only behaves on training-shaped rows (one observation each). Reconstructing that at inference time, rather than feeding a dense panel, is what turns "0 % for everyone" into a usable risk profile.
 - **Multi-output TFLite conversion reorders heads.** Always recover the mapping empirically (`ehr_tflite_map.py`) rather than trusting tensor index or name order.
+- **Make the live path testable without hardware.** A 150-line MQTT broker and a node simulator that speaks the firmware's exact topics mean the end-to-end alert path is a unit test (`tests/test_live_pipeline.py`), not a demo that only works in the lab.
+
+## Known limitations
+
+- The EHR checkpoint was trained on a thin synthetic FHIR corpus: 31 of its 51 risk heads never fired in training and always read 0 % (the demo labels them). Retraining needs a FHIR bundle zip (`ehr_preprocess.py`).
+- The ECG model generalises to unseen patients at AUC 0.92; unusual but normal QRS/T morphologies can be flagged, which is why the fusion engine treats ECG as corroborating evidence rather than paging on it alone.
+- The vision dataset is not in the repo (only the checkpoint), so that model cannot be re-evaluated here.
+- The node firmware publishes ECG but not the 50 Hz IMU stream yet (see above).
 
 ## Future work
 
