@@ -6,10 +6,14 @@ ESP32-CAM MJPEG stream.
     python run_vision.py --source http://192.168.1.50:81/stream   # ESP32-CAM
     python run_vision.py --source clip.mp4 --headless --save out.mp4
     python run_vision.py --source frames/ --headless  # score a folder of images
+    python run_vision.py --source clip.mp4 --headless --publish localhost   # feed the fusion monitor
 
 The original script only supported webcam 0 with a GUI window, which meant the
 vision modality could not be demonstrated on a headless machine or against the
 ESP32-CAM stream the rest of the project is built around.
+
+With --publish, every verdict is sent to MQTT as "Class,confidence" on
+--vision-topic, which is what fusion/run_monitor.py --live consumes.
 
 Press 'q' to quit the live window.
 """
@@ -35,6 +39,29 @@ from vision_model import (  # noqa: E402
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 
 
+class Publisher:
+    """Optional MQTT sink for verdicts; a no-op when --publish is not given."""
+
+    def __init__(self, broker, port, topic):
+        self.client = None
+        if broker:
+            import paho.mqtt.client as mqtt
+            self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ward_vision")
+            self.client.connect(broker, port, 60)
+            self.client.loop_start()
+            self.topic = topic
+            print(f"Publishing verdicts to {topic} on {broker}:{port}")
+
+    def send(self, class_name, confidence):
+        if self.client:
+            self.client.publish(self.topic, f"{class_name},{confidence:.3f}")
+
+    def close(self):
+        if self.client:
+            self.client.loop_stop()
+            self.client.disconnect()
+
+
 def annotate(frame, class_name, confidence):
     color = CLASS_COLORS.get(class_name, FALLBACK_COLOR)
     cv2.putText(frame, f"{class_name} ({confidence * 100:.1f}%)", (15, 45),
@@ -51,7 +78,7 @@ def image_paths(source):
     return [p for p in matches if p.lower().endswith(IMAGE_SUFFIXES)]
 
 
-def run_images(paths, model, class_names, device, args):
+def run_images(paths, model, class_names, device, args, publisher):
     counts = {}
     for path in paths:
         frame = cv2.imread(path)
@@ -61,6 +88,7 @@ def run_images(paths, model, class_names, device, args):
         pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         name, conf = predict_image(model, class_names, pil, device)
         counts[name] = counts.get(name, 0) + 1
+        publisher.send(name, conf)
         print(f"  {os.path.basename(path):<40} {name:<10} {conf * 100:5.1f}%")
         if args.save:
             os.makedirs(args.save, exist_ok=True)
@@ -71,7 +99,7 @@ def run_images(paths, model, class_names, device, args):
         print(f"Annotated frames written to {args.save}/")
 
 
-def run_stream(source, model, class_names, device, args):
+def run_stream(source, model, class_names, device, args, publisher):
     capture = cv2.VideoCapture(int(source) if str(source).isdigit() else source)
     if not capture.isOpened():
         sys.exit(f"Could not open video source {source!r}. "
@@ -94,6 +122,7 @@ def run_stream(source, model, class_names, device, args):
             pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             name, conf = predict_image(model, class_names, pil, device)
             annotate(frame, name, conf)
+            publisher.send(name, conf)
 
             if writer is not None:
                 writer.write(frame)
@@ -126,18 +155,25 @@ def main():
     parser.add_argument("--max-frames", type=int, help="stop after this many frames")
     parser.add_argument("--log-every", type=int, default=10, help="headless: print every Nth frame")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--publish", metavar="BROKER", help="MQTT broker host to publish verdicts to")
+    parser.add_argument("--port", type=int, default=1883)
+    parser.add_argument("--vision-topic", default="test/vision")
     args = parser.parse_args()
 
     print(f"Using device: {args.device}")
     model, class_names = load_model(args.model, args.device)
     print(f"Loaded {os.path.basename(args.model)} -> classes {class_names}")
 
+    publisher = Publisher(args.publish, args.port, args.vision_topic)
     paths = image_paths(args.source) if not str(args.source).isdigit() else []
-    if paths:
-        print(f"Scoring {len(paths)} image(s):")
-        run_images(paths, model, class_names, args.device, args)
-    else:
-        run_stream(args.source, model, class_names, args.device, args)
+    try:
+        if paths:
+            print(f"Scoring {len(paths)} image(s):")
+            run_images(paths, model, class_names, args.device, args, publisher)
+        else:
+            run_stream(args.source, model, class_names, args.device, args, publisher)
+    finally:
+        publisher.close()
 
 
 if __name__ == "__main__":

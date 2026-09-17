@@ -1,19 +1,24 @@
 """Live ward monitor - runs the whole pipeline end to end.
 
 Pulls each patient's clinical risk profile from the EHR model, classifies IMU
-windows with the trained motion CNN, and fuses the two (plus optional camera
-and ECG evidence) into an alert level per the rules in fusion_engine.py.
+windows with the trained motion CNN, scores ECG with the arrhythmia CNN, takes
+the camera's verdict, and fuses everything into an alert level per the rules
+in fusion_engine.py.
 
-    python fusion/run_monitor.py                 # scripted ward scenario
-    python fusion/run_monitor.py --no-ehr        # skip TensorFlow, motion only
-    python fusion/run_monitor.py --live          # classify IMU windows from MQTT
+    python fusion/run_monitor.py                 # scripted ward scenario, all models
+    python fusion/run_monitor.py --no-ehr --no-ecg   # PyTorch only, no TensorFlow
+    python fusion/run_monitor.py --live          # consume MQTT (see simulate_node.py)
 
-Without hardware the IMU stream is simulated from the same physics generators
-the classifier was trained on, so the demo runs on any machine.
+Without hardware the scenario is fed from the same physics generators the
+motion classifier was trained on and from real ECG recordings (a held-out
+volunteer's AD8232 trace and a MIT-BIH test patient with PVCs), so the demo
+exercises the real models on every machine. `--live` consumes exactly what
+the ESP32 node (or fusion/simulate_node.py) publishes.
 """
 import argparse
 import os
 import sys
+import threading
 import time
 
 import numpy as np
@@ -21,29 +26,19 @@ import numpy as np
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "gesture_recognition"))
 sys.path.insert(0, os.path.join(ROOT, "ehr_risk"))
+sys.path.insert(0, os.path.join(ROOT, "arrhythmia"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fusion_engine import AlertLevel, Observation, fuse  # noqa: E402
-
-# Scripted scenario: (seconds, IMU class id, camera verdict, P(arrhythmia)).
-# Camera/ECG are None when that sensor has nothing to say.
-SCENARIO = [
-    ("resting quietly", 0, "Normal", 0.02),
-    ("sitting up in bed", 1, "Normal", 0.03),
-    ("walking to the bathroom", 2, "Normal", 0.05),
-    ("restless, shifting about", 6, "Normal", 0.08),
-    ("restless, camera sees distress", 6, "Distress", 0.10),
-    ("slumping sideways", 5, None, 0.12),
-    ("breathing hard, ECG irregular", 10, "Distress", 0.88),
-    ("FALL", 3, "Danger", 0.35),
-    ("motionless on the floor", 0, "Danger", 0.30),
-]
+from scenario import ECG_FALLBACK_PROB, SCENARIO, ecg_excerpt  # noqa: E402
 
 COLORS = {
     AlertLevel.NONE: "\033[32m", AlertLevel.INFO: "\033[36m", AlertLevel.WATCH: "\033[33m",
     AlertLevel.ALERT: "\033[31m", AlertLevel.CRITICAL: "\033[1;37;41m",
 }
 RESET = "\033[0m"
+VISION_MAX_AGE = 5.0          # seconds a camera verdict stays valid
+ECG_MAX_AGE = 15.0            # seconds an ECG score stays valid
 
 
 def colorize(level, text, enabled):
@@ -65,67 +60,129 @@ def load_clinical_risks(patient_id, db_path):
     return record, result.risks
 
 
-def simulated_windows():
-    """Yield (caption, imu_window, vision_class, arrhythmia_prob) for the scenario."""
+def load_ecg_detector():
+    from ecg_model import ArrhythmiaDetector
+    return ArrhythmiaDetector()
+
+
+def simulated_windows(detector):
+    """Yield (caption, imu_window, vision_class, vision_conf, arrhythmia_prob) for the scenario."""
     from synthetic_signals import make_window
 
+    cache = {}
     for caption, class_id, vision, ecg in SCENARIO:
-        yield caption, make_window(class_id), vision, ecg
-
-
-def live_windows(broker, topic, port):
-    """Yield windows assembled from `ax,ay,az` messages (g, 50 Hz) on an MQTT topic.
-
-    Note: the shipped ecg_imu_node firmware only publishes a 1 Hz dashboard
-    line to test/sensors; a 50 Hz accelerometer publish is a small addition.
-    """
-    import paho.mqtt.client as mqtt  # optional dependency
-
-    from ward_model import WINDOW_SIZE
-
-    buffer = []
-    client = mqtt.Client()
-
-    def on_message(_client, _userdata, msg):
-        try:
-            parts = [float(v) for v in msg.payload.decode().split(",")[:3]]
-        except ValueError:
-            return
-        if len(parts) == 3:
-            buffer.append(parts)
-
-    client.on_message = on_message
-    client.connect(broker, port, 60)
-    client.subscribe(topic)
-    client.loop_start()
-    print(f"Subscribed to {topic} on {broker}:{port}; waiting for IMU samples...")
-    try:
-        while True:
-            if len(buffer) >= WINDOW_SIZE:
-                window = np.array(buffer[:WINDOW_SIZE])
-                del buffer[:WINDOW_SIZE]
-                yield "live IMU window", window, None, None
+        prob = None
+        if ecg is not None:
+            if detector is None:
+                prob = ECG_FALLBACK_PROB[ecg]
             else:
-                time.sleep(0.2)
-    finally:
-        client.loop_stop()
-        client.disconnect()
+                if ecg not in cache:
+                    cache[ecg] = float(detector.score(ecg_excerpt(ecg)).max())
+                prob = cache[ecg]
+        yield caption, make_window(class_id), vision, 0.9 if vision else 0.0, prob
 
 
-def main():
+class LiveFeed:
+    """Assembles fusion inputs from the node's MQTT topics.
+
+    IMU samples are grouped into classifier windows; ECG batches fill a
+    rolling 10 s buffer that is re-scored whenever it is full; the newest
+    camera verdict is attached while it is fresh.
+    """
+
+    def __init__(self, broker, port, detector, topics, idle_timeout=None, max_windows=None):
+        import paho.mqtt.client as mqtt
+
+        from ward_model import WINDOW_SIZE
+
+        self.window_size = WINDOW_SIZE
+        self.detector = detector
+        self.topics = topics
+        self.idle_timeout, self.max_windows = idle_timeout, max_windows
+        self.lock = threading.Lock()
+        self.imu, self.ecg = [], []
+        self.vision = (None, 0.0, 0.0)          # class, confidence, timestamp
+        self.ecg_prob = (None, 0.0)             # probability, timestamp
+        self.last_message = time.monotonic()
+        self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="ward_monitor")
+        self.client.on_message = self._on_message
+        self.client.connect(broker, port, 60)
+        for t in topics.values():
+            self.client.subscribe(t)
+        self.client.loop_start()
+
+    def _on_message(self, _client, _userdata, msg):
+        payload = msg.payload.decode(errors="replace")
+        now = time.monotonic()
+        self.last_message = now
+        try:
+            with self.lock:
+                if msg.topic == self.topics["imu"]:
+                    self.imu.append([float(v) for v in payload.split(",")[:3]])
+                elif msg.topic == self.topics["ecg"]:
+                    self.ecg.extend(float(v) for v in payload.split(","))
+                    if self.detector is not None and len(self.ecg) >= self.detector.window_size:
+                        self.ecg = self.ecg[-self.detector.window_size:]
+                        prob = float(self.detector.score(np.array(self.ecg, dtype=np.float32)).max())
+                        self.ecg_prob = (prob, now)
+                elif msg.topic == self.topics["vision"]:
+                    name, conf = payload.split(",")
+                    self.vision = (name.strip(), float(conf), now)
+        except ValueError:
+            pass                                    # malformed line: ignore, as the firmware may pad
+
+    def close(self):
+        self.client.loop_stop()
+        self.client.disconnect()
+
+    def __iter__(self):
+        n = 0
+        try:
+            while self.max_windows is None or n < self.max_windows:
+                with self.lock:
+                    ready = len(self.imu) >= self.window_size
+                    if ready:
+                        window = np.array(self.imu[:self.window_size])
+                        del self.imu[:self.window_size]
+                        now = time.monotonic()
+                        vclass, vconf, vt = self.vision
+                        if now - vt > VISION_MAX_AGE:
+                            vclass, vconf = None, 0.0
+                        prob, pt = self.ecg_prob
+                        if now - pt > ECG_MAX_AGE:
+                            prob = None
+                if ready:
+                    n += 1
+                    yield "live window", window, vclass, vconf, prob
+                elif self.idle_timeout and time.monotonic() - self.last_message > self.idle_timeout:
+                    print(f"No messages for {self.idle_timeout:g} s; stopping.")
+                    return
+                else:
+                    time.sleep(0.05)
+        finally:
+            self.close()
+
+
+def main(argv=None, on_subscribed=None):
+    """on_subscribed: optional callback invoked once the live feed is listening (used by live_demo.py)."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--patient", default="101", help="patient id in EHR_patient_records.json")
     parser.add_argument("--db", default=os.path.join(ROOT, "ehr_risk", "EHR_patient_records.json"))
     parser.add_argument("--model", default=None, help="IMU checkpoint (default: ward_model_strict.pth)")
-    parser.add_argument("--no-ehr", action="store_true", help="skip the EHR model (no TensorFlow needed)")
-    parser.add_argument("--live", action="store_true", help="read IMU windows from MQTT instead of simulating")
+    parser.add_argument("--no-ehr", action="store_true", help="skip the EHR model")
+    parser.add_argument("--no-ecg", action="store_true", help="skip the arrhythmia model (scripted ECG probabilities)")
+    parser.add_argument("--live", action="store_true", help="consume sensor topics from MQTT instead of simulating")
     parser.add_argument("--broker", default="localhost")
     parser.add_argument("--port", type=int, default=1883)
-    parser.add_argument("--topic", default="test/imu_raw")
+    parser.add_argument("--imu-topic", default="test/imu_raw")
+    parser.add_argument("--ecg-topic", default="test/ecg_raw")
+    parser.add_argument("--vision-topic", default="test/vision")
+    parser.add_argument("--idle-timeout", type=float, default=None, help="live: stop after this many silent seconds")
+    parser.add_argument("--max-windows", type=int, default=None, help="live: stop after this many IMU windows")
     parser.add_argument("--delay", type=float, default=1.0, help="seconds between scenario steps")
     parser.add_argument("--no-color", action="store_true")
     parser.add_argument("--seed", type=int, default=0, help="RNG seed for the simulated IMU stream")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     np.random.seed(args.seed)
 
     from ward_model import DEFAULT_MODEL_FILE, load_model, predict_window
@@ -138,12 +195,19 @@ def main():
 
     record, clinical_risks = None, {}
     if not args.no_ehr:
-        print("[1/2] Scoring EHR clinical risk...")
+        print("[1/3] Scoring EHR clinical risk...")
         try:
             record, clinical_risks = load_clinical_risks(args.patient, args.db)
         except Exception as e:
             print(f"      EHR model unavailable ({e}); continuing without clinical context.")
-    print("[2/2] Loading IMU motion classifier...")
+    detector = None
+    if not args.no_ecg:
+        print("[2/3] Loading ECG arrhythmia classifier...")
+        try:
+            detector = load_ecg_detector()
+        except Exception as e:
+            print(f"      ECG model unavailable ({e}); using scripted ECG probabilities.")
+    print("[3/3] Loading IMU motion classifier...")
     model = load_model(args.model or DEFAULT_MODEL_FILE)
 
     if record:
@@ -154,19 +218,27 @@ def main():
     else:
         print(f"\nPatient {args.patient}: no clinical context loaded")
 
-    source = live_windows(args.broker, args.topic, args.port) if args.live else simulated_windows()
+    if args.live:
+        topics = {"imu": args.imu_topic, "ecg": args.ecg_topic, "vision": args.vision_topic}
+        source = LiveFeed(args.broker, args.port, detector, topics, args.idle_timeout, args.max_windows)
+        print(f"Subscribed to {', '.join(topics.values())} on {args.broker}:{args.port}; waiting for samples...")
+        if on_subscribed:
+            on_subscribed()
+    else:
+        source = simulated_windows(detector)
+
     print("\n" + "-" * 78)
-    print(f"{'t':>4}  {'situation':<32}{'motion':<20}{'level':<10}score")
+    print(f"{'t':>4}  {'situation':<30}{'motion':<19}{'ecg':>5}  {'cam':<9}{'level':<9}score")
     print("-" * 78)
 
-    pages = 0
-    for step, (caption, window, vision_class, ecg_prob) in enumerate(source):
+    pages, step = 0, -1
+    for step, (caption, window, vision_class, vision_conf, ecg_prob) in enumerate(source):
         motion_class, motion_conf, _ = predict_window(model, window)
         obs = Observation(
             motion_class=motion_class,
             motion_confidence=motion_conf,
             vision_class=vision_class,
-            vision_confidence=0.9 if vision_class else 0.0,
+            vision_confidence=vision_conf,
             arrhythmia_probability=ecg_prob,
             clinical_risks=clinical_risks,
         )
@@ -174,19 +246,22 @@ def main():
         pages += result.should_page
 
         motion_text = f"{motion_class} {motion_conf * 100:.0f}%"
-        line = f"{step:>4}  {caption:<32}{motion_text:<20}{result.level.label:<10}{result.score:.2f}"
-        print(colorize(result.level, line, color))
+        ecg_text = f"{ecg_prob:.2f}" if ecg_prob is not None else "-"
+        line = (f"{step:>4}  {caption:<30}{motion_text:<19}{ecg_text:>5}  {(vision_class or '-'):<9}"
+                f"{result.level.label:<9}{result.score:.2f}")
+        print(colorize(result.level, line, color), flush=True)
         if result.level >= AlertLevel.WATCH:
             for reason in result.reasons:
                 print(f"        - {reason}")
         if result.should_page:
-            print(colorize(result.level, "        >>> PAGING NURSE", color))
+            print(colorize(result.level, "        >>> PAGING NURSE", color), flush=True)
 
         if not args.live and args.delay:
             time.sleep(args.delay)
 
     print("-" * 78)
     print(f"{pages} page(s) raised over {step + 1} windows.")
+    return pages
 
 
 if __name__ == "__main__":
